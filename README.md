@@ -24,7 +24,47 @@ _Suggestions are always welcome!_
 
 <br>
 
-## 📌  Introduction
+## 🧬 Protein Models
+
+| Feature | Protein Model 1 | Protein Model 2 |
+| :--- | :--- | :--- |
+| **Submission Score** | **0.745** | **0.784** |
+| **Core Architecture** | Fine-tuned **ESM2 (t33)** | Custom **Transformer** |
+| **Input** | Sequence (Fine-tuned) | Pre-computed Embeddings (5120 dim) |
+| **Details** | Top 4 layers unfrozen + MLP Head | 8 Layers, 8 Heads, 1024 Dim, RoPE |
+
+<details>
+<summary><b>Click for Detailed Architecture</b></summary>
+
+### Protein Model 1
+This model utilizes a fine-tuned **ESM2 (t33_650M_UR50D)** encoder.
+- **Architecture:** The pre-trained ESM2 encoder is used with the top 4 layers unfrozen for fine-tuning.
+- **Classifier:** A Multi-Layer Perceptron (MLP) head is attached to the encoder output.
+    - Input Dimension: 1280 (ESM2 embedding size)
+    - Hidden Layer: 512 units with ReLU activation
+    - Output Dimension: 10 (9 structural states + padding)
+
+### Protein Model 2
+This model is a custom **Transformer** architecture operating on pre-computed ESM embeddings.
+- **Input:** Pre-computed embeddings with a dimension of 5120 (likely from a larger ESM2 model like `esm2_t48_15B_UR50D`).
+- **Architecture:**
+    - **Layers:** 8 Transformer encoder layers
+    - **Attention Heads:** 8 heads
+    - **Model Dimension:** 1024
+    - **Feed-Forward Network (FFN) Dimension:** 2048
+    - **Positional Encoding:** Rotary Positional Embeddings (RoPE)
+    - **Dropout:** 0.1
+- **Training:** Trained with a Warmup Cosine Learning Rate scheduler.
+
+</details>
+
+### 📈 Validation Accuracy
+
+![Validation Best Accuracy](data/validation_best_acc.png)
+
+<br>
+
+## 📌  Introduction
 
 **Why you might want to use it:**
 
@@ -133,9 +173,10 @@ The directory structure of new project looks like this:
 ├── requirements.txt          <- File for installing python dependencies
 ├── setup.py                  <- File for installing project as a package
 └── README.md
-```
 
 <br>
+
+
 
 ## 🚀  Quickstart
 
