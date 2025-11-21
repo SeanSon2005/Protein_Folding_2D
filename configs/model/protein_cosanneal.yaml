@@ -1,0 +1,29 @@
+_target_: src.models.protein_module.ProteinLitModule
+
+optimizer:
+  _target_: torch.optim.Adam
+  _partial_: true
+  lr: 0.0005
+  weight_decay: 2e-4
+
+# Cosine Anneal with Warmup
+scheduler:
+  target_class: src.models.components.lr_schedulers.WarmupCosineLR
+  warmup_ratio: 0.1
+  eta_min: 1e-5
+  interval: step
+  frequency: 1
+  monitor: null
+  requires_total_steps: true
+
+net:
+  _target_: src.models.components.esm_and_classification_head_net.ESMAndClassificationHeadNet
+  esm_model_name: esm2_t33_650M_UR50D
+  num_classes: 10
+  num_finetune_layers: 4
+
+# DSSP8 has 9 structural states + padding index 0
+num_classes: 10
+
+# compile model for faster training with pytorch 2.0
+compile: false
