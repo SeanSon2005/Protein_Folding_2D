@@ -175,3 +175,99 @@ class ESMTransformerNet(nn.Module):
         x = self.final_norm(x)
         logits = self.classifier(x)
         return logits
+
+
+class ESMTransformerResNet(nn.Module):
+    """Transformer classifier operating on pre-computed ESM embeddings with gated residue embedding fusion."""
+
+    def __init__(
+        self,
+        input_dim: int = 5120,
+        projection_dim: int = 1024,
+        model_dim: int = 1024,
+        num_layers: int = 6,
+        num_heads: int = 16,
+        ffn_dim: Optional[int] = None,
+        dropout: float = 0.1,
+        rope_theta: float = 10000.0,
+        num_classes: int = 10,
+        residue_vocab_size: int = 27,  # PAD + 26 uppercase letters (A-Z)
+        residue_embed_dim: int = 128,  # Intermediate dimension for residue embedding
+    ) -> None:
+        super().__init__()
+        if projection_dim <= 0:
+            raise ValueError("projection_dim must be positive.")
+        if model_dim % num_heads != 0:
+            raise ValueError("model_dim must be divisible by num_heads.")
+
+        # Residue embedding pathway: embedding -> linear -> project to input_dim
+        self.residue_embedding = nn.Embedding(
+            num_embeddings=residue_vocab_size,
+            embedding_dim=residue_embed_dim,
+            padding_idx=0,  # PAD token index
+        )
+        self.residue_proj = nn.Linear(residue_embed_dim, input_dim)
+        
+        # Gating mechanism
+        self.gate_linear = nn.Linear(input_dim * 2, 1)
+        
+        # Main projection pathway
+        self.input_proj = nn.Linear(input_dim, projection_dim)
+        self.input_norm = nn.LayerNorm(projection_dim)
+        
+        if projection_dim != model_dim:
+            self.model_proj = nn.Linear(projection_dim, model_dim)
+        else:
+            self.model_proj = nn.Identity()
+
+        self.input_dropout = nn.Dropout(dropout)
+        hidden_dim = ffn_dim or model_dim * 4
+        self.layers = nn.ModuleList(
+            [
+                TransformerBlock(
+                    dim=model_dim,
+                    num_heads=num_heads,
+                    ffn_dim=hidden_dim,
+                    dropout=dropout,
+                    rope_theta=rope_theta,
+                )
+                for _ in range(num_layers)
+            ]
+        )
+        self.final_norm = nn.LayerNorm(model_dim)
+        self.classifier = nn.Linear(model_dim, num_classes)
+
+    def forward(self, x: torch.Tensor, residue_ids: torch.Tensor) -> torch.Tensor:
+        """
+        :param x: (batch, seq_len, input_dim) tensor of ESM embeddings.
+        :param residue_ids: (batch, seq_len) tensor of amino acid indices.
+        :return: (batch, seq_len, num_classes) logits.
+        """
+        if x.dim() != 3:
+            raise ValueError("Input tensor must be of shape (batch, seq_len, features).")
+        if residue_ids.dim() != 2:
+            raise ValueError("residue_ids must be of shape (batch, seq_len).")
+
+        padding_mask = (x.abs().sum(dim=-1) == 0)
+
+        # Residue embedding: embed -> linear -> project to input_dim
+        residue_emb = self.residue_embedding(residue_ids)  # (B, L, residue_embed_dim)
+        residue_emb = self.residue_proj(residue_emb)  # (B, L, input_dim)
+        
+        # # Gated Residual
+        concat = torch.cat([x, residue_emb], dim=-1)  # (B, L, input_dim * 2)
+        gate = torch.sigmoid(self.gate_linear(concat))  # (B, L, 1)
+        x = x + gate * residue_emb
+        
+        # Project to model dimension
+        x = self.input_proj(x)
+        x = self.input_norm(x)
+        x = self.model_proj(x)
+        x = self.input_dropout(x)
+
+        for layer in self.layers:
+            x = layer(x, padding_mask=padding_mask)
+
+        x = self.final_norm(x)
+        logits = self.classifier(x)
+        return logits

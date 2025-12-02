@@ -1,10 +1,10 @@
-_target_: src.models.protein_module.ProteinLitModule
+_target_: src.models.protein_module.ProteinContactModule
 
 optimizer:
   _target_: torch.optim.Adam
   _partial_: true
   lr: 0.0003
-  weight_decay: 2e-4
+  weight_decay: 8e-4
 
 # Cosine Anneal with Warmup
 scheduler:
@@ -17,15 +17,19 @@ scheduler:
   requires_total_steps: true
 
 net:
-  _target_: src.models.components.esm_transformer_net.ESMTransformerNet
+  _target_: src.models.components.esm_fold_contact_net.ESMFoldContactNet
   input_dim: 5120
-  projection_dim: 2048
-  model_dim: 2048
-  num_layers: 12
-  num_heads: 16
-  ffn_dim: 4096
+  projection_dim: 512
+  model_dim: 512
+  num_layers: 4
   dropout: 0.2
-  rope_theta: 10000.0
+  pair_dim: 16
+  pair_mlp_dim: 32
+  sequence_head_width: 16
+  pairwise_head_width: 8
+  relative_distance_bins: 32  # clip [-32, 32], plus far bucket
+  max_recycles: 1
+  chunk_size: 8
   num_classes: ${..num_classes}
 
 # DSSP8 has 9 structural states + padding index 0

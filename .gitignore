@@ -5,4 +5,6 @@
 /data/esm2_token_embeddings_sharded_fp16_sorted
 /data/esm2_embeddings_test_fixed.pt
 /data/esm2_embeddings_test.pt
+/data/mmcif/
+/data/contact_maps
 /predictions/*

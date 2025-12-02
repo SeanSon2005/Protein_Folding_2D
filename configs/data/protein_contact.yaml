@@ -1,8 +1,9 @@
-_target_: src.data.protein_2_datamodule.ProteinDataModule2
+_target_: src.data.protein_contact_datamodule.ProteinContactDataModule
 
 metadata_csv: ${paths.data_dir}ps4_data.csv
 embeddings_dir: ${paths.data_dir}esm2_token_embeddings_sharded_fp16_sorted/
-batch_size: 8
+batch_size: 1
 train_val_test_split: [0.9, 0.1, 0.0]
-num_workers: 8
+num_workers: 31
 pin_memory: False
+max_seq_len: 768

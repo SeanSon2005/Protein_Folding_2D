@@ -260,7 +260,470 @@ class ProteinLitModule(LightningModule):
                 "lr_scheduler": lr_scheduler_config,
             }
         return {"optimizer": optimizer}
+    
+class ProteinCRFLitModule(ProteinLitModule):
+    """LightningModule for Protein Folding classification with CRF layer.
+    
+    Uses a linear-chain CRF on top of the emission scores from the neural network.
+    Training uses CRF negative log-likelihood loss.
+    Inference uses Viterbi decoding to find the best label sequence.
+    
+    Note: The network `net` should output emissions of shape (B, L, num_classes - 1)
+    since padding (index 0) is not a valid CRF state. Alternatively, if net outputs
+    (B, L, num_classes), set exclude_padding_class=True to slice off the padding dim.
+    """
+
+    def __init__(
+        self,
+        net: torch.nn.Module,
+        optimizer: torch.optim.Optimizer,
+        scheduler: Optional[DictConfig],
+        compile: bool,
+        num_classes: int = 10,
+        exclude_padding_class: bool = True,
+    ) -> None:
+        """Initialize a `ProteinCRFLitModule`.
+
+        :param net: The model to train (outputs emission scores).
+        :param optimizer: The optimizer to use for training.
+        :param scheduler: The learning rate scheduler to use for training.
+        :param num_classes: Total number of classes including padding (index 0).
+        :param exclude_padding_class: If True, slice emissions to exclude padding class.
+        """
+        super().__init__(
+            net=net,
+            optimizer=optimizer,
+            scheduler=scheduler,
+            compile=compile,
+            num_classes=num_classes,
+        )
+        
+        self.exclude_padding_class = exclude_padding_class
+        
+        # Number of actual tags for CRF (excluding padding)
+        num_tags = num_classes - 1
+        
+        # Import here to avoid circular imports
+        from src.models.components.crf import ProteinCRF
+        
+        # Initialize CRF layer
+        self.crf = ProteinCRF(num_tags=num_tags, batch_first=True)
+        
+        # Override criterion - we'll use CRF loss instead
+        # Keep parent's criterion for potential comparison, but mark it unused
+        self._ce_criterion = self.criterion
+        self.criterion = None  # CRF loss is computed via self.crf
+
+    def model_step(
+        self, batch: Tuple[torch.Tensor, torch.Tensor], decode: bool = True
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Perform a single model step on a batch of data.
+
+        :param batch: A batch of data (a tuple) containing the input tensor 
+                      of sequences and target labels.
+        :param decode: If True, run Viterbi decoding for predictions. If False,
+                       use argmax on emissions (faster, for training metrics).
+
+        :return: A tuple containing (in order):
+            - A tensor of CRF negative log-likelihood loss.
+            - A tensor of predictions (Viterbi-decoded if decode=True, else argmax).
+            - A tensor of target labels.
+        """
+        x, y = batch
+        logits = self.forward(x)
+        # logits: (B, L, C) where C = num_classes
+        
+        # Extract emissions for CRF (exclude padding class if needed)
+        if self.exclude_padding_class:
+            # Slice off index 0 (padding) -> emissions for classes 1..C
+            emissions = logits[:, :, 1:]
+        else:
+            emissions = logits
+        
+        # Create mask: True for non-padding positions
+        mask = (y != 0)
+        
+        # CRF negative log-likelihood loss
+        loss = self.crf(emissions, y, mask=mask, reduction="mean")
+        
+        if decode:
+            # Viterbi decoding for predictions (slower but exact)
+            preds = self.crf.decode(emissions, mask=mask)
+        else:
+            # Fast approximation: argmax on emissions (ignores transitions)
+            # Shift +1 to match label space (CRF state 0 -> label 1)
+            preds = torch.argmax(emissions, dim=2) + 1
+            # Zero out padding positions
+            preds = preds * mask.long()
+        
+        return loss, preds, y
+
+    def training_step(
+        self, batch: Tuple[torch.Tensor, torch.Tensor], batch_idx: int
+    ) -> torch.Tensor:
+        """Perform a single training step on a batch of data from the training set.
+
+        Uses fast argmax predictions instead of Viterbi for training metrics.
+        """
+        loss, preds, targets = self.model_step(batch, decode=False)
+
+        # update and log metrics
+        self.train_loss(loss)
+        self.train_acc(preds, targets)
+        self.log("train/loss", self.train_loss, on_step=False, on_epoch=True, prog_bar=True)
+        self.log("train/acc", self.train_acc, on_step=False, on_epoch=True, prog_bar=True)
+
+        return loss
+
+    def validation_step(self, batch: Tuple[torch.Tensor, torch.Tensor], batch_idx: int) -> None:
+        """Perform a single validation step on a batch of data from the validation set.
+
+        Uses Viterbi decoding for accurate validation metrics.
+        """
+        loss, preds, targets = self.model_step(batch, decode=True)
+
+        # update and log metrics
+        self.val_loss(loss)
+        self.val_acc(preds, targets)
+        self.log("val/loss", self.val_loss, on_step=False, on_epoch=True, prog_bar=True)
+        self.log("val/acc", self.val_acc, on_step=False, on_epoch=True, prog_bar=True)
+
+    def test_step(self, batch: Tuple[torch.Tensor, torch.Tensor], batch_idx: int) -> None:
+        """Perform a single test step on a batch of data from the test set.
+
+        Uses Viterbi decoding for accurate test metrics.
+        """
+        loss, preds, targets = self.model_step(batch, decode=True)
+
+        # update and log metrics
+        self.test_loss(loss)
+        self.test_acc(preds, targets)
+        self.log("test/loss", self.test_loss, on_step=False, on_epoch=True, prog_bar=True)
+        self.log("test/acc", self.test_acc, on_step=False, on_epoch=True, prog_bar=True)
 
 
-if __name__ == "__main__":
-    _ = ProteinLitModule(None, None, None, None)
+class ProteinResLitModule(ProteinLitModule):
+    """LightningModule for Protein Folding with residue embeddings.
+    
+    Handles 3-tuple batches: (embeddings, residue_ids, targets) for models
+    like ESMTransformerResNet that use both ESM embeddings and residue sequences.
+    """
+
+    def forward(self, x: torch.Tensor, residue_ids: torch.Tensor) -> torch.Tensor:
+        """Perform a forward pass through the model `self.net`.
+
+        :param x: A tensor of ESM embeddings.
+        :param residue_ids: A tensor of residue (amino acid) indices.
+        :return: A tensor of logits.
+        """
+        return self.net(x, residue_ids)
+
+    def model_step(
+        self, batch: Tuple[torch.Tensor, torch.Tensor, torch.Tensor]
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Perform a single model step on a batch of data.
+
+        :param batch: A batch of data (a 3-tuple) containing ESM embeddings,
+                      residue IDs, and target labels.
+
+        :return: A tuple containing (in order):
+            - A tensor of losses.
+            - A tensor of predictions.
+            - A tensor of target labels.
+        """
+        x, residue_ids, y = batch
+        logits = self.forward(x, residue_ids)
+        # logits: (B, L, C)
+        # y: (B, L)
+        # Permute logits for CrossEntropyLoss: (B, C, L)
+        loss = self.criterion(logits.permute(0, 2, 1), y)
+        preds = torch.argmax(logits, dim=2)
+        return loss, preds, y
+
+    def training_step(
+        self, batch: Tuple[torch.Tensor, torch.Tensor, torch.Tensor], batch_idx: int
+    ) -> torch.Tensor:
+        """Perform a single training step on a batch of data from the training set."""
+        loss, preds, targets = self.model_step(batch)
+
+        self.train_loss(loss)
+        self.train_acc(preds, targets)
+        self.log("train/loss", self.train_loss, on_step=False, on_epoch=True, prog_bar=True)
+        self.log("train/acc", self.train_acc, on_step=False, on_epoch=True, prog_bar=True)
+
+        return loss
+
+    def validation_step(self, batch: Tuple[torch.Tensor, torch.Tensor, torch.Tensor], batch_idx: int) -> None:
+        """Perform a single validation step on a batch of data from the validation set."""
+        loss, preds, targets = self.model_step(batch)
+
+        self.val_loss(loss)
+        self.val_acc(preds, targets)
+        self.log("val/loss", self.val_loss, on_step=False, on_epoch=True, prog_bar=True)
+        self.log("val/acc", self.val_acc, on_step=False, on_epoch=True, prog_bar=True)
+
+    def test_step(self, batch: Tuple[torch.Tensor, torch.Tensor, torch.Tensor], batch_idx: int) -> None:
+        """Perform a single test step on a batch of data from the test set."""
+        loss, preds, targets = self.model_step(batch)
+
+        self.test_loss(loss)
+        self.test_acc(preds, targets)
+        self.log("test/loss", self.test_loss, on_step=False, on_epoch=True, prog_bar=True)
+        self.log("test/acc", self.test_acc, on_step=False, on_epoch=True, prog_bar=True)
+
+
+class ProteinResCRFLitModule(ProteinResLitModule):
+    """LightningModule for Protein Folding with residue embeddings and CRF layer.
+    
+    Handles 3-tuple batches: (embeddings, residue_ids, targets) for models
+    like ESMTransformerResNet, with a CRF layer for sequence labeling.
+    """
+
+    def __init__(
+        self,
+        net: torch.nn.Module,
+        optimizer: torch.optim.Optimizer,
+        scheduler: Optional[DictConfig],
+        compile: bool,
+        num_classes: int = 10,
+        exclude_padding_class: bool = True,
+    ) -> None:
+        """Initialize a `ProteinResCRFLitModule`.
+
+        :param net: The model to train (outputs emission scores).
+        :param optimizer: The optimizer to use for training.
+        :param scheduler: The learning rate scheduler to use for training.
+        :param num_classes: Total number of classes including padding (index 0).
+        :param exclude_padding_class: If True, slice emissions to exclude padding class.
+        """
+        super().__init__(
+            net=net,
+            optimizer=optimizer,
+            scheduler=scheduler,
+            compile=compile,
+            num_classes=num_classes,
+        )
+        
+        self.exclude_padding_class = exclude_padding_class
+        
+        # Number of actual tags for CRF (excluding padding)
+        num_tags = num_classes - 1
+        
+        # Import here to avoid circular imports
+        from src.models.components.crf import ProteinCRF
+        
+        # Initialize CRF layer
+        self.crf = ProteinCRF(num_tags=num_tags, batch_first=True)
+        
+        # Override criterion - we'll use CRF loss instead
+        self._ce_criterion = self.criterion
+        self.criterion = None  # CRF loss is computed via self.crf
+
+    def model_step(
+        self, batch: Tuple[torch.Tensor, torch.Tensor, torch.Tensor], decode: bool = True
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Perform a single model step on a batch of data.
+
+        :param batch: A batch of data (a 3-tuple) containing ESM embeddings,
+                      residue IDs, and target labels.
+        :param decode: If True, run Viterbi decoding for predictions.
+
+        :return: A tuple containing (in order):
+            - A tensor of CRF negative log-likelihood loss.
+            - A tensor of predictions.
+            - A tensor of target labels.
+        """
+        x, residue_ids, y = batch
+        logits = self.forward(x, residue_ids)
+        # logits: (B, L, C) where C = num_classes
+        
+        # Extract emissions for CRF (exclude padding class if needed)
+        if self.exclude_padding_class:
+            emissions = logits[:, :, 1:]
+        else:
+            emissions = logits
+        
+        # Create mask: True for non-padding positions
+        mask = (y != 0)
+        
+        # CRF negative log-likelihood loss
+        loss = self.crf(emissions, y, mask=mask, reduction="mean")
+        
+        if decode:
+            preds = self.crf.decode(emissions, mask=mask)
+        else:
+            preds = torch.argmax(emissions, dim=2) + 1
+            preds = preds * mask.long()
+        
+        return loss, preds, y
+
+    def training_step(
+        self, batch: Tuple[torch.Tensor, torch.Tensor, torch.Tensor], batch_idx: int
+    ) -> torch.Tensor:
+        """Perform a single training step using fast argmax predictions."""
+        loss, preds, targets = self.model_step(batch, decode=False)
+
+        self.train_loss(loss)
+        self.train_acc(preds, targets)
+        self.log("train/loss", self.train_loss, on_step=False, on_epoch=True, prog_bar=True)
+        self.log("train/acc", self.train_acc, on_step=False, on_epoch=True, prog_bar=True)
+
+        return loss
+
+    def validation_step(self, batch: Tuple[torch.Tensor, torch.Tensor, torch.Tensor], batch_idx: int) -> None:
+        """Perform a single validation step using Viterbi decoding."""
+        loss, preds, targets = self.model_step(batch, decode=True)
+
+        self.val_loss(loss)
+        self.val_acc(preds, targets)
+        self.log("val/loss", self.val_loss, on_step=False, on_epoch=True, prog_bar=True)
+        self.log("val/acc", self.val_acc, on_step=False, on_epoch=True, prog_bar=True)
+
+    def test_step(self, batch: Tuple[torch.Tensor, torch.Tensor, torch.Tensor], batch_idx: int) -> None:
+        """Perform a single test step using Viterbi decoding."""
+        loss, preds, targets = self.model_step(batch, decode=True)
+
+        self.test_loss(loss)
+        self.test_acc(preds, targets)
+        self.log("test/loss", self.test_loss, on_step=False, on_epoch=True, prog_bar=True)
+        self.log("test/acc", self.test_acc, on_step=False, on_epoch=True, prog_bar=True)
+
+
+class ProteinContactModule(ProteinLitModule):
+    """LightningModule for joint sequence (CRF) + contact prediction."""
+
+    def __init__(
+        self,
+        net: torch.nn.Module,
+        optimizer: torch.optim.Optimizer,
+        scheduler: Optional[DictConfig],
+        compile: bool,
+        num_classes: int = 10,
+        exclude_padding_class: bool = True,
+        contact_weight: float = 1.0,
+    ) -> None:
+        super().__init__(
+            net=net,
+            optimizer=optimizer,
+            scheduler=scheduler,
+            compile=compile,
+            num_classes=num_classes,
+        )
+        self.exclude_padding_class = exclude_padding_class
+        self.contact_weight = contact_weight
+
+        num_tags = num_classes - 1
+        from src.models.components.crf import ProteinCRF
+
+        self.crf = ProteinCRF(num_tags=num_tags, batch_first=True)
+        self.bce = torch.nn.BCEWithLogitsLoss(reduction="none")
+
+        # separate trackers
+        self.train_seq_loss = MeanMetric()
+        self.train_contact_loss = MeanMetric()
+        self.val_seq_loss = MeanMetric()
+        self.val_contact_loss = MeanMetric()
+        self.test_seq_loss = MeanMetric()
+        self.test_contact_loss = MeanMetric()
+
+    def forward(
+        self,
+        embeddings: torch.Tensor,
+        residue_ids: torch.Tensor,
+        valid_mask: Optional[torch.Tensor] = None,
+    ):
+        return self.net(embeddings, residue_ids, valid_mask)
+
+    def _contact_loss(
+        self,
+        contact_logits: torch.Tensor,
+        contact_targets: torch.Tensor,
+        contact_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        loss_raw = self.bce(contact_logits, contact_targets)
+        masked_loss = loss_raw * contact_mask
+        denom = contact_mask.sum().clamp(min=1)
+        return masked_loss.sum() / denom
+
+    def model_step(
+        self,
+        batch: Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
+        decode: bool = True,
+    ):
+        embeddings, residue_ids, targets, contact_map, valid_mask = batch
+        seq_logits, contact_logits, trunk_mask = self.forward(embeddings, residue_ids, valid_mask)
+
+        # Sequence loss via CRF
+        emissions = seq_logits[:, :, 1:] if self.exclude_padding_class else seq_logits
+        mask_seq = targets != 0
+        seq_loss = self.crf(emissions, targets, mask=mask_seq, reduction="mean")
+        if decode:
+            preds = self.crf.decode(emissions, mask=mask_seq)
+        else:
+            preds = torch.argmax(emissions, dim=2) + (1 if self.exclude_padding_class else 0)
+            preds = preds * mask_seq.long()
+
+        # Contact loss (mask-aware BCE)
+        # contact_mask combines padding mask and valid structure mask if provided
+        if valid_mask is not None:
+            contact_valid = mask_seq & valid_mask
+        else:
+            contact_valid = mask_seq
+        contact_mask = contact_valid.unsqueeze(1) & contact_valid.unsqueeze(2)
+        contact_loss = self._contact_loss(contact_logits, contact_map, contact_mask)
+
+        total_loss = seq_loss + self.contact_weight * contact_loss
+        return total_loss, seq_loss.detach(), contact_loss.detach(), preds, targets
+
+    def training_step(
+        self,
+        batch: Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
+        batch_idx: int,
+    ) -> torch.Tensor:
+        loss, seq_loss, contact_loss, preds, targets = self.model_step(batch, decode=False)
+
+        self.train_loss(loss)
+        self.train_seq_loss(seq_loss)
+        self.train_contact_loss(contact_loss)
+        self.train_acc(preds, targets)
+
+        self.log("train/loss", self.train_loss, on_step=False, on_epoch=True, prog_bar=True)
+        self.log("train/seq_loss", self.train_seq_loss, on_step=False, on_epoch=True)
+        self.log("train/contact_loss", self.train_contact_loss, on_step=False, on_epoch=True)
+        self.log("train/acc", self.train_acc, on_step=False, on_epoch=True, prog_bar=True)
+
+        return loss
+
+    def validation_step(
+        self,
+        batch: Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
+        batch_idx: int,
+    ) -> None:
+        loss, seq_loss, contact_loss, preds, targets = self.model_step(batch, decode=True)
+
+        self.val_loss(loss)
+        self.val_seq_loss(seq_loss)
+        self.val_contact_loss(contact_loss)
+        self.val_acc(preds, targets)
+
+        self.log("val/loss", self.val_loss, on_step=False, on_epoch=True, prog_bar=True)
+        self.log("val/seq_loss", self.val_seq_loss, on_step=False, on_epoch=True)
+        self.log("val/contact_loss", self.val_contact_loss, on_step=False, on_epoch=True)
+        self.log("val/acc", self.val_acc, on_step=False, on_epoch=True, prog_bar=True)
+
+    def test_step(
+        self,
+        batch: Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
+        batch_idx: int,
+    ) -> None:
+        loss, seq_loss, contact_loss, preds, targets = self.model_step(batch, decode=True)
+
+        self.test_loss(loss)
+        self.test_seq_loss(seq_loss)
+        self.test_contact_loss(contact_loss)
+        self.test_acc(preds, targets)
+
+        self.log("test/loss", self.test_loss, on_step=False, on_epoch=True, prog_bar=True)
+        self.log("test/seq_loss", self.test_seq_loss, on_step=False, on_epoch=True)
+        self.log("test/contact_loss", self.test_contact_loss, on_step=False, on_epoch=True)
+        self.log("test/acc", self.test_acc, on_step=False, on_epoch=True, prog_bar=True)
